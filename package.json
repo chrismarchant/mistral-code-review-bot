@@ -1,0 +1,36 @@
+{
+  "name": "mistral-code-review-bot",
+  "version": "1.0.0",
+  "private": true,
+  "description": "A Probot code review bot powered by Mistral models",
+  "license": "ISC",
+  "type": "module",
+  "keywords": [
+    "probot",
+    "github",
+    "probot-app",
+    "code review",
+    "mistral"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "build:action": "npm run build && ncc build dist/github-action.js -o action",
+    "start": "node -r dotenv/config dist/index.js",
+    "test": "npm run build && node --test test/*.test.mjs"
+  },
+  "dependencies": {
+    "@probot/adapter-github-actions": "^3.1.3",
+    "dotenv": "^16.4.5",
+    "loglevel": "^1.9.2",
+    "minimatch": "^10.0.1",
+    "probot": "^12.3.3"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "@vercel/ncc": "^0.38.3",
+    "typescript": "^5.4.5"
+  },
+  "engines": {
+    "node": ">= 18"
+  }
+}

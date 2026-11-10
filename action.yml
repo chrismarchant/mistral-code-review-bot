@@ -1,0 +1,8 @@
+name: Mistral Code Reviewer
+description: 'A Code Review Action powered by Mistral models'
+branding:
+  icon: 'gift'
+  color: 'orange'
+runs:
+  using: 'node20'
+  main: 'action/index.js'
