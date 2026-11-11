@@ -66,6 +66,13 @@ Verify independently: `sha256sum report.md` must equal `manifest.reportSha256`.
 5. Makes up to `maxModelCalls` Mistral calls (diff overview → per-category → synthesis) under the token budget with per-request timeout and retries.
 6. Writes report + manifest; prints disposition, SHA256, call/token/cost usage.
 
+**Disposition guards (deterministic, applied after model synthesis):**
+- any `critical` finding ⇒ REJECT (overrides the model)
+- synthesis missing/malformed ⇒ REJECT (incomplete reviews never pass)
+- any unresolved evidence item or coverage gap (omitted patches, GitHub 300-file cap, context-budget skips, non-`ahead` compare status) ⇒ ACCEPT is downgraded to ACCEPT WITH CONDITIONS, never unconditional
+
+**Reviewer identity:** the CLI resolves the token's identity live (`GET /user` → User, else `GET /app` → App Bot) and records it in `manifest.execution.reviewerIdentity` with an independence note: the bot — not its implementation session — is the reviewer.
+
 ## 7. Failure / exit codes
 
 | Code | Meaning |
