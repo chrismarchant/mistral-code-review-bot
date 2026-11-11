@@ -170298,6 +170298,122 @@ minimatch.unescape = unescape_unescape;
 ;// CONCATENATED MODULE: ./dist/mistral.js
 const DEFAULT_ENDPOINT = 'https://api.mistral.ai/v1';
 const DEFAULT_MODEL = 'mistral-large-latest';
+const DEFAULT_REQUEST_TIMEOUT_MS = 120000;
+/** The model returned no usable text (e.g. only a thinking block). */
+class MistralNoTextError extends Error {
+    finishReason;
+    constructor(finishReason) {
+        super(`Mistral returned no review text for this file (finish_reason=${finishReason})`);
+        this.finishReason = finishReason;
+        this.name = 'MistralNoTextError';
+    }
+}
+class MistralTimeoutError extends Error {
+    timeoutMs;
+    constructor(timeoutMs) {
+        super(`Mistral request timed out after ${timeoutMs} ms`);
+        this.timeoutMs = timeoutMs;
+        this.name = 'MistralTimeoutError';
+    }
+}
+class MistralHttpError extends Error {
+    status;
+    constructor(status, detail) {
+        super(`Mistral API request failed with status ${status}: ${detail}`);
+        this.status = status;
+        this.name = 'MistralHttpError';
+    }
+}
+const getRequestTimeoutMs = () => {
+    const value = Number(process.env.REQUEST_TIMEOUT_MS);
+    return Number.isFinite(value) && value > 0
+        ? value
+        : DEFAULT_REQUEST_TIMEOUT_MS;
+};
+/**
+ * Returns the answer text of a chat completion message. `content` is either a
+ * string or (for reasoning models such as mistral-large-4-0) an array of
+ * blocks; only `text` blocks are kept, `thinking` and unknown blocks are
+ * ignored so model internals are never posted.
+ */
+const extractMessageText = (content) => {
+    if (typeof content === 'string') {
+        return content;
+    }
+    if (!Array.isArray(content)) {
+        return '';
+    }
+    return content
+        .filter((block) => !!block &&
+        typeof block === 'object' &&
+        block.type === 'text' &&
+        typeof block.text === 'string')
+        .map((block) => block.text)
+        .join('');
+};
+/**
+ * Parses model output as JSON, tolerating ```json fences and surrounding
+ * prose by extracting the first top-level JSON object. Returns undefined if
+ * nothing parses.
+ */
+const parseModelJson = (text) => {
+    const trimmed = text.trim();
+    const candidates = [trimmed];
+    const fenced = trimmed.match(/```(?:json)?\s*\n?([\s\S]*?)```/i);
+    if (fenced) {
+        candidates.push(fenced[1].trim());
+    }
+    const object = extractFirstJsonObject(trimmed);
+    if (object) {
+        candidates.push(object);
+    }
+    for (const candidate of candidates) {
+        try {
+            return JSON.parse(candidate);
+        }
+        catch {
+            // try the next candidate
+        }
+    }
+    return undefined;
+};
+const extractFirstJsonObject = (text) => {
+    const start = text.indexOf('{');
+    if (start < 0) {
+        return undefined;
+    }
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+    for (let i = start; i < text.length; i++) {
+        const ch = text[i];
+        if (inString) {
+            if (escaped) {
+                escaped = false;
+            }
+            else if (ch === '\\') {
+                escaped = true;
+            }
+            else if (ch === '"') {
+                inString = false;
+            }
+            continue;
+        }
+        if (ch === '"') {
+            inString = true;
+        }
+        else if (ch === '{') {
+            depth++;
+        }
+        else if (ch === '}') {
+            depth--;
+            if (depth === 0) {
+                return text.slice(start, i + 1);
+            }
+        }
+    }
+    return undefined;
+};
 /**
  * Minimal client for the Mistral chat completions API
  * (OpenAI-compatible: POST {endpoint}/chat/completions).
@@ -170342,52 +170458,67 @@ class MistralChat {
         if (!patch) {
             return { lgtm: true, review_comment: '' };
         }
-        console.time('code-review cost');
         const prompt = this.generatePrompt(patch);
         const temperature = process.env.temperature !== undefined ? +process.env.temperature : 1;
         const topP = process.env.top_p !== undefined ? +process.env.top_p : 1;
-        const res = await this.fetchImpl(`${this.endpoint}/chat/completions`, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                Authorization: `Bearer ${this.apiKey}`,
-            },
-            body: JSON.stringify({
-                model: this.model,
-                messages: [{ role: 'user', content: prompt }],
-                temperature,
-                top_p: topP,
-                ...(process.env.max_tokens
-                    ? { max_tokens: +process.env.max_tokens }
-                    : {}),
-                response_format: { type: 'json_object' },
-            }),
-        });
-        console.timeEnd('code-review cost');
-        if (!res.ok) {
-            throw new Error(`Mistral API request failed with status ${res.status}: ${await res.text()}`);
-        }
-        const data = (await res.json());
-        const content = data.choices?.[0]?.message?.content || '';
-        if (content) {
-            try {
-                const json = JSON.parse(content);
-                if (json.reviews && Array.isArray(json.reviews)) {
-                    return json.reviews;
-                }
-                return json;
+        const timeoutMs = getRequestTimeoutMs();
+        let data;
+        console.time('code-review cost');
+        try {
+            const res = await this.fetchImpl(`${this.endpoint}/chat/completions`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                    Authorization: `Bearer ${this.apiKey}`,
+                },
+                body: JSON.stringify({
+                    model: this.model,
+                    messages: [{ role: 'user', content: prompt }],
+                    temperature,
+                    top_p: topP,
+                    ...(process.env.max_tokens
+                        ? { max_tokens: +process.env.max_tokens }
+                        : {}),
+                    response_format: { type: 'json_object' },
+                }),
+                signal: AbortSignal.timeout(timeoutMs),
+            });
+            if (!res.ok) {
+                throw new MistralHttpError(res.status, await res.text());
             }
-            catch {
-                // Model did not return valid JSON: keep the raw text as a single review.
-                const firstLine = patch.split('\n')[0];
-                return {
-                    lgtm: false,
-                    hunk_header: firstLine.startsWith('@@') ? firstLine : undefined,
-                    review_comment: content,
-                };
-            }
+            data = (await res.json());
         }
-        return { lgtm: true, review_comment: '' };
+        catch (err) {
+            const name = err?.name;
+            if (name === 'TimeoutError' || name === 'AbortError') {
+                throw new MistralTimeoutError(timeoutMs);
+            }
+            throw err;
+        }
+        finally {
+            console.timeEnd('code-review cost');
+        }
+        const choice = data?.choices?.[0];
+        const content = extractMessageText(choice?.message?.content);
+        if (!content.trim()) {
+            throw new MistralNoTextError(choice?.finish_reason || 'unknown');
+        }
+        const json = parseModelJson(content);
+        if (json && typeof json === 'object' && !Array.isArray(json)) {
+            if (Array.isArray(json.reviews)) {
+                return json.reviews;
+            }
+            return json;
+        }
+        // Model did not return valid JSON: keep the text as a single raw review,
+        // which the bot posts as a general (non-inline) comment.
+        const firstLine = patch.split('\n')[0];
+        return {
+            lgtm: false,
+            hunk_header: firstLine.startsWith('@@') ? firstLine : undefined,
+            review_comment: content,
+            raw: true,
+        };
     };
 }
 
@@ -170410,7 +170541,7 @@ const MAX_PATCH_COUNT = process.env.MAX_PATCH_LENGTH
     ? +process.env.MAX_PATCH_LENGTH
     : Infinity;
 const parseHunkHeader = (hunkHeader) => {
-    if (!hunkHeader) {
+    if (!hunkHeader || typeof hunkHeader !== 'string') {
         return null;
     }
     const match = hunkHeader
@@ -170474,11 +170605,105 @@ const createInlineReviewComment = (path, body, hunkHeader, patch) => {
         side: location.side,
     };
 };
-const createReviewBody = (hasInlineComments, bodyComments) => {
-    const heading = hasInlineComments || bodyComments.length
+const createReviewBody = (hasInlineComments, bodyComments, fileNotes = []) => {
+    const heading = hasInlineComments || bodyComments.length || fileNotes.length
         ? 'Code review by Mistral'
         : 'LGTM 👍';
-    return [heading, ...bodyComments, REVIEW_MARKER].join('\n\n');
+    const notes = fileNotes.length
+        ? [`**Files not reviewed:**\n${fileNotes.map((n) => `- ${n}`).join('\n')}`]
+        : [];
+    return [heading, ...bodyComments, ...notes, REVIEW_MARKER].join('\n\n');
+};
+const isNonEmptyString = (value) => typeof value === 'string' && value.trim() !== '';
+/**
+ * Final guard before createReview: drops any comment whose body (or location)
+ * is not valid, so GitHub cannot reject the review with HTTP 422.
+ */
+const sanitizeReviewComments = (comments) => comments.filter((c) => {
+    const comment = c;
+    const valid = !!comment &&
+        isNonEmptyString(comment.body) &&
+        isNonEmptyString(comment.path) &&
+        Number.isInteger(comment.line) &&
+        comment.line > 0 &&
+        (comment.side === 'RIGHT' || comment.side === 'LEFT');
+    if (!valid) {
+        log.error('dropping invalid inline review comment');
+    }
+    return valid;
+});
+const sanitizeReviewBody = (body) => isNonEmptyString(body) ? body : `Code review by Mistral\n\n${REVIEW_MARKER}`;
+const escapeFilename = (filename) => filename.replace(/`/g, '\\`');
+const describeFailure = (err) => {
+    if (err instanceof MistralNoTextError) {
+        return err.message;
+    }
+    const name = err?.name;
+    if (name === 'MistralTimeoutError') {
+        return err.message;
+    }
+    if (name === 'MistralHttpError') {
+        return `Mistral API request failed with status ${err.status}`;
+    }
+    return 'review failed (see the action log)';
+};
+/**
+ * Reviews each file independently: a failure (HTTP error, timeout, no text,
+ * parse error) is recorded as a note and does not lose the other files.
+ */
+const reviewFiles = async (chat, files, maxPatchLength = MAX_PATCH_COUNT) => {
+    const result = {
+        comments: [],
+        bodyComments: [],
+        fileNotes: [],
+        attempted: 0,
+        failed: 0,
+    };
+    for (const file of files) {
+        const patch = file.patch || '';
+        if (file.status !== 'modified' && file.status !== 'added') {
+            continue;
+        }
+        if (!patch || patch.length > maxPatchLength) {
+            log.info(`${file.filename} skipped caused by its diff is too large`);
+            continue;
+        }
+        result.attempted++;
+        const filename = escapeFilename(file.filename);
+        try {
+            const res = await chat.codeReview(patch);
+            // res can be a single review or an array of reviews (one for each hunk)
+            const reviews = Array.isArray(res) ? res : [res];
+            for (const review of reviews) {
+                if (!review || typeof review !== 'object' || review.lgtm) {
+                    continue;
+                }
+                if (!isNonEmptyString(review.review_comment)) {
+                    if (review.review_comment) {
+                        log.error(`dropping non-string review comment for ${file.filename}`);
+                    }
+                    continue;
+                }
+                const inlineComment = review.raw
+                    ? null
+                    : createInlineReviewComment(file.filename, review.review_comment, review.hunk_header, patch);
+                if (!inlineComment) {
+                    result.bodyComments.push(`**File:** \`${filename}\`\n\n${review.review_comment}`);
+                    if (!review.raw) {
+                        log.error(`Failed to locate inline review comment: ${review.hunk_header || 'missing hunk header'}`);
+                    }
+                    continue;
+                }
+                result.comments.push(inlineComment);
+            }
+        }
+        catch (e) {
+            result.failed++;
+            result.fileNotes.push(`\`${filename}\`: ${describeFailure(e)}`);
+            log.info(`review ${file.filename} failed`, e);
+        }
+    }
+    return result;
 };
 const getChangedFiles = async (context) => {
     const repo = context.repo();
@@ -170668,55 +170893,28 @@ const robot = (app) => {
             log.info('no change found');
             return 'no change';
         }
+        log.info(`reviewing ${changedFiles.length} file(s) with model ${chat.model} at head ${pull_request.head.sha}`);
         console.time('mistral cost');
-        const ress = [];
-        const bodyComments = [];
-        for (let i = 0; i < changedFiles.length; i++) {
-            const file = changedFiles[i];
-            const patch = file.patch || '';
-            if (file.status !== 'modified' && file.status !== 'added') {
-                continue;
-            }
-            if (!patch || patch.length > MAX_PATCH_COUNT) {
-                log.info(`${file.filename} skipped caused by its diff is too large`);
-                continue;
-            }
-            try {
-                const res = await chat.codeReview(patch);
-                // res can be a single review or an array of reviews (one for each hunk)
-                const reviews = Array.isArray(res) ? res : [res];
-                for (const review of reviews) {
-                    if (!review.lgtm && !!review.review_comment) {
-                        const inlineComment = createInlineReviewComment(file.filename, review.review_comment, review.hunk_header, patch);
-                        if (!inlineComment) {
-                            const filename = file.filename.replace(/`/g, '\\`');
-                            bodyComments.push(`**File:** \`${filename}\`\n\n${review.review_comment}`);
-                            log.error(`Failed to locate inline review comment: ${review.hunk_header || 'missing hunk header'}`);
-                            continue;
-                        }
-                        ress.push(inlineComment);
-                    }
-                }
-            }
-            catch (e) {
-                log.info(`review ${file.filename} failed`, e);
-                throw e;
-            }
-        }
+        const result = await reviewFiles(chat, changedFiles);
+        const comments = sanitizeReviewComments(result.comments);
+        const body = sanitizeReviewBody(createReviewBody(comments.length > 0, result.bodyComments, result.fileNotes));
         try {
             await context.octokit.pulls.createReview({
                 repo: repo.repo,
                 owner: repo.owner,
                 pull_number: context.pullRequest().pull_number,
-                body: createReviewBody(ress.length > 0, bodyComments),
+                body,
                 event: 'COMMENT',
                 commit_id: context.payload.pull_request.head.sha,
-                comments: ress,
+                comments,
             });
         }
         catch (e) {
             log.info(`Failed to create review`, e);
             throw e;
+        }
+        if (result.attempted > 0 && result.failed === result.attempted) {
+            throw new Error(`All ${result.attempted} file review(s) failed; see the review body and log`);
         }
         console.timeEnd('mistral cost');
         log.info('successfully reviewed', context.payload.pull_request.html_url);
