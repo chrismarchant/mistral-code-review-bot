@@ -31,9 +31,13 @@ type FetchLike = (
 const b64url = (buf: Buffer | string): string =>
   Buffer.from(buf).toString('base64url');
 
+/** Normalize PEMs pasted into .env files (literal \n escapes, stray whitespace). */
+export const normalizePem = (pem: string): string =>
+  pem.replace(/\\n/g, '\n').replace(/\\r/g, '\r').trim() + '\n';
+
 /** Mint a short-lived (<=10 min) app JWT. Exported for tests. */
 export const mintAppJwt = (appId: string, pem: string, now = Date.now()): string => {
-  const key = createPrivateKey(pem);
+  const key = createPrivateKey(normalizePem(pem));
   const header = b64url(JSON.stringify({ alg: 'RS256', typ: 'JWT' }));
   const iat = Math.floor(now / 1000) - 60; // clock skew allowance
   const exp = iat + 540; // 9 minutes

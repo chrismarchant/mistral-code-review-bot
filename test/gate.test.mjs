@@ -565,3 +565,16 @@ test('getViewerIdentity falls back to GET /installation for installation tokens'
   assert.equal(identity.slug, 'mcrb-gate-review');
   assert.equal(identity.source, 'GET /installation');
 });
+
+test('appauth: PEM with literal \\n escapes (as pasted into .env) is normalized and signs', async () => {
+  const { mintAppJwt, _testGenerateKeyPair } = await import('../dist/gate/appauth.js');
+  const { privateKey, publicKey } = _testGenerateKeyPair();
+  const pem = privateKey.export({ type: 'pkcs8', format: 'pem' }).toString();
+  const escaped = pem.replace(/\n/g, '\\n'); // what a .env file often contains
+  const jwt = mintAppJwt('42', escaped);
+  const [h, p, s] = jwt.split('.');
+  const { createVerify } = await import('node:crypto');
+  const v = createVerify('RSA-SHA256');
+  v.update(`${h}.${p}`);
+  assert.ok(v.verify(publicKey, s, 'base64url'));
+});
