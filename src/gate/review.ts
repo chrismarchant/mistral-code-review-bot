@@ -39,6 +39,18 @@ const BINARY_EXT = /\.(png|jpe?g|gif|ico|pdf|zip|gz|tar|woff2?|ttf|eot|mp4|mov|e
 
 export const isBinaryFile = (filename: string): boolean => BINARY_EXT.test(filename);
 
+const GENERATED_PATH =
+  /(^|\/)(dist|build|vendor|node_modules)\/|^action\/index\.js$|\.min\.(js|css)$|(^|\/)(package-lock\.json|yarn\.lock|pnpm-lock\.yaml)$/;
+const LOW_SIGNAL_PATH = /(^|\/)(docs?|examples?)\/|\.(md|txt|rst)$/i;
+
+/**
+ * Priority for fetching surrounding source context when maxFiles is smaller
+ * than the diff: 0 = source/config, 1 = docs/examples, 2 = generated output.
+ * Sorting is stable, so GitHub's file order is kept within a class.
+ */
+export const contextPriority = (filename: string): number =>
+  GENERATED_PATH.test(filename) ? 2 : LOW_SIGNAL_PATH.test(filename) ? 1 : 0;
+
 const truncate = (s: string, max: number): { text: string; truncated: boolean } =>
   s.length > max ? { text: s.slice(0, max), truncated: true } : { text: s, truncated: false };
 
@@ -150,7 +162,11 @@ export const runGateReview = async (deps: {
   }
 
   // 5. surrounding source + config at candidate head, bounded by profile
-  const selected = reviewable.slice(0, profile.limits.maxFiles);
+  // (source code is prioritised over docs/examples and generated bundles so a
+  // small maxFiles is not spent on low-signal files)
+  const selected = [...reviewable]
+    .sort((a, b) => contextPriority(a.filename) - contextPriority(b.filename))
+    .slice(0, profile.limits.maxFiles);
   if (reviewable.length > selected.length) {
     budget.gap(
       `maxFiles (${profile.limits.maxFiles}) reached; ${reviewable.length - selected.length} changed file(s) not inspected`
@@ -243,8 +259,43 @@ export const runGateReview = async (deps: {
         text: `${e.ref}\n${e.summary}${e.content ? `\n${e.content}` : ''}`,
       }));
 
+  // Synthesis is the only step that yields findings and a disposition, so a
+  // call and its estimated tokens are always reserved for it: the preliminary
+  // assessments are skipped (and reported as coverage gaps) rather than
+  // allowed to starve it. Synthesis receives the prior assessments as data.
+  const cap = (p: string) => p.slice(0, profile.limits.maxPromptCharsPerCall);
+  const synthesisItems = () => [
+    ...evidenceForModel(['pr', 'diff', 'source', 'ci', 'dependency', 'security']),
+    ...modelAssessments.map((m) => ({
+      label: `assessment:${m.step} [model-output]`,
+      text: JSON.stringify(m.output),
+    })),
+  ];
+  const synthesisReserve = () =>
+    budget.estimateTokens(cap(buildUserPrompt(SYNTHESIS_PROMPT, synthesisItems())));
+  const preliminary = async (
+    step: string,
+    instruction: string,
+    items: Array<{ label: string; text: string }>
+  ) => {
+    // allow for this step's own output being appended to the synthesis prompt
+    const outputAllowance = 1024;
+    if (
+      !budget.canAfford(
+        cap(buildUserPrompt(instruction, items)),
+        1,
+        synthesisReserve() + outputAllowance
+      )
+    ) {
+      budget.gap(`${step}: skipped to reserve model-call/token budget for synthesis`);
+      log(`${step}: skipped (budget reserved for synthesis)`);
+      return;
+    }
+    modelAssessments.push({ step, output: await callModel(step, instruction, items) });
+  };
+
   try {
-    const diffItems = [
+    await preliminary('diff-overview', DIFF_ASSESSMENT_PROMPT, [
       ...evidenceForModel(['pr', 'diff']),
       {
         label: 'diff-file-list',
@@ -254,30 +305,19 @@ export const runGateReview = async (deps: {
         label: `patch:${f.filename}`,
         text: f.patch ?? '',
       })),
-    ];
-    modelAssessments.push({
-      step: 'diff-overview',
-      output: await callModel('diff-overview', DIFF_ASSESSMENT_PROMPT, diffItems),
-    });
+    ]);
 
     for (const cat of ['security', 'dependency', 'ci'] as const) {
-      modelAssessments.push({
-        step: `assessment-${cat}`,
-        output: await callModel(
-          `assessment-${cat}`,
-          CATEGORY_ASSESSMENT_PROMPT(cat),
-          evidenceForModel([cat === 'ci' ? 'ci' : cat, 'diff', 'source'])
-        ),
-      });
+      await preliminary(
+        `assessment-${cat}`,
+        CATEGORY_ASSESSMENT_PROMPT(cat),
+        evidenceForModel([cat === 'ci' ? 'ci' : cat, 'diff', 'source'])
+      );
     }
 
     modelAssessments.push({
       step: 'synthesis',
-      output: await callModel(
-        'synthesis',
-        SYNTHESIS_PROMPT,
-        evidenceForModel(['pr', 'diff', 'source', 'ci', 'dependency', 'security'])
-      ),
+      output: await callModel('synthesis', SYNTHESIS_PROMPT, synthesisItems()),
     });
   } catch (e) {
     if (e instanceof BudgetExceededError) {

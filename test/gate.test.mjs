@@ -5,7 +5,7 @@ import { createHash } from 'node:crypto';
 import { GitHubEvidence } from '../dist/gate/github.js';
 import { DEFAULT_PROFILE } from '../dist/gate/profile.js';
 import { publishGateReview, publicationMarker } from '../dist/gate/publish.js';
-import { runGateReview } from '../dist/gate/review.js';
+import { contextPriority, runGateReview } from '../dist/gate/review.js';
 import { REVIEWER_VERSION, validateManifest } from '../dist/gate/report.js';
 import { REVIEWER_SYSTEM_PROMPT } from '../dist/gate/prompts.js';
 import { ShaMismatchError } from '../dist/gate/types.js';
@@ -294,15 +294,105 @@ test('prompt injection: untrusted content is delimited and escaped; system promp
 });
 
 test('budget exhaustion: coverage gap reported, disposition forced to REJECT', async () => {
+  // budget too small for even the synthesis call
   const profile = {
     ...DEFAULT_PROFILE,
-    limits: { ...DEFAULT_PROFILE.limits, maxModelCalls: 1 },
+    limits: { ...DEFAULT_PROFILE.limits, tokenBudget: 10 },
   };
-  const { result } = await runDefault({ profile });
+  const { result, chat } = await runDefault({ profile });
+  assert.equal(chat.calls.length, 0);
   assert.equal(result.disposition, 'REJECT');
-  assert.ok(result.budget.gaps.some((g) => g.includes('maxModelCalls')));
+  assert.ok(result.budget.gaps.some((g) => g.includes('tokenBudget')));
   assert.ok(result.evidence.some((e) => e.id === 'budget' && e.kind === 'unresolved'));
   assert.deepEqual(validateManifest(result.manifest, result.report), []);
+});
+
+test('regression: a tight maxModelCalls reserves the last call for synthesis', async () => {
+  // 4 calls < the 5 steps of a full review; previously synthesis never ran,
+  // so the review always ended REJECT with zero findings.
+  const profile = {
+    ...DEFAULT_PROFILE,
+    limits: { ...DEFAULT_PROFILE.limits, maxModelCalls: 4 },
+  };
+  const { result, chat } = await runDefault({
+    profile,
+    chatHandler: (n, messages) => ({
+      content: JSON.stringify(
+        messages[1].content.startsWith('You are performing the final synthesis')
+          ? goodSynthesis
+          : { findings: [], notes: `prelim-${n}` }
+      ),
+      usage: { prompt_tokens: 1000, completion_tokens: 200, total_tokens: 1200 },
+    }),
+  });
+  assert.equal(chat.calls.length, 4);
+  assert.match(chat.calls[3].messages[1].content, /final synthesis/);
+  assert.equal(result.disposition, 'ACCEPT WITH CONDITIONS');
+  assert.equal(result.findings.length, 1);
+  assert.ok(result.budget.gaps.some((g) => /assessment-ci: skipped to reserve/.test(g)));
+  assert.ok(!result.evidence.some((e) => e.id === 'budget'));
+});
+
+test('regression: a tight tokenBudget skips preliminary steps instead of starving synthesis', async () => {
+  const profile = {
+    ...DEFAULT_PROFILE,
+    limits: { ...DEFAULT_PROFILE.limits, tokenBudget: 3000 },
+  };
+  const { result, chat } = await runDefault({
+    profile,
+    chatHandler: (n, messages) => ({
+      content: JSON.stringify(
+        messages[1].content.startsWith('You are performing the final synthesis')
+          ? { ...goodSynthesis, disposition: 'ACCEPT' }
+          : { findings: [] }
+      ),
+      usage: { prompt_tokens: 1500, completion_tokens: 100, total_tokens: 1600 },
+    }),
+  });
+  const last = chat.calls.at(-1).messages[1].content;
+  assert.match(last, /final synthesis/);
+  assert.ok(chat.calls.length < 5);
+  assert.ok(result.budget.gaps.some((g) => g.includes('skipped to reserve')));
+  // skipped steps are coverage gaps, so an unconditional ACCEPT is impossible
+  assert.equal(result.disposition, 'ACCEPT WITH CONDITIONS');
+});
+
+test('regression: synthesis receives the prior model assessments as delimited data', async () => {
+  const { chat } = await runDefault({
+    chatHandler: (n) => ({
+      content: JSON.stringify(
+        n === 1 ? { summary: 'OVERVIEW-MARKER', risk_areas: [] } : n <= 4 ? { findings: [], notes: `NOTE-${n}` } : goodSynthesis
+      ),
+      usage: { total_tokens: 5 },
+    }),
+  });
+  const synth = chat.calls[4].messages[1].content;
+  assert.match(synth, /label=assessment.diff-overview..model-output/);
+  assert.match(synth, /OVERVIEW-MARKER/);
+  assert.match(synth, /NOTE-3/);
+  const begin = synth.indexOf('----- BEGIN UNTRUSTED EVIDENCE -----');
+  assert.ok(begin >= 0 && synth.indexOf('OVERVIEW-MARKER') > begin);
+  assert.equal(chat.calls[4].messages[0].content, REVIEWER_SYSTEM_PROMPT);
+});
+
+test('regression: maxFiles selects source files before docs and generated bundles', async () => {
+  assert.deepEqual(
+    ['README.md', 'action/index.js', 'docs/x.md', 'examples/r.md', 'package-lock.json', 'src/a.ts', 'package.json']
+      .map(contextPriority),
+    [1, 2, 1, 1, 2, 0, 0]
+  );
+  const files = ['README.md', 'action/index.js', 'docs/guide.md', 'src/core.ts'].map((filename) => ({
+    filename, status: 'modified', additions: 1, deletions: 0, patch: '@@ -1 +1 @@\n-a\n+b\n',
+  }));
+  const { result } = await runDefault({
+    profile: { ...DEFAULT_PROFILE, limits: { ...DEFAULT_PROFILE.limits, maxFiles: 1 } },
+    ghOverrides: { '/compare/': okJson({ ...comparePayload, files }) },
+  });
+  assert.deepEqual(
+    result.evidence.filter((e) => e.category === 'source').map((e) => e.id),
+    ['src:src/core.ts']
+  );
+  assert.ok(result.budget.gaps.some((g) => g.includes('maxFiles (1) reached; 3 changed file(s)')));
 });
 
 test('critical finding can never yield ACCEPT', async () => {

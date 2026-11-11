@@ -66,7 +66,7 @@ Verify independently: `sha256sum report.md` must equal `manifest.reportSha256`.
 2. GETs the full `base...head` compare diff (records GitHub's 300-file truncation as a coverage gap).
 3. GETs source context at the candidate SHA, bounded by the profile; classifies binary/deleted/renamed/truncated-patch files explicitly.
 4. GETs CI check-runs + workflow runs, dependency SBOM/lockfile, Dependabot/vulnerability-alert evidence; failures become `unresolved` evidence, never a pass.
-5. Makes up to `maxModelCalls` Mistral calls (diff overview → per-category → synthesis) under the token budget with per-request timeout and retries.
+5. Makes up to `maxModelCalls` Mistral calls (diff overview → per-category → synthesis) under the token budget with per-request timeout and retries. One call and its estimated tokens are always reserved for synthesis, which receives the earlier assessments as delimited data; when the budget is too tight, the preliminary steps are skipped and listed as coverage limitations (so ACCEPT is not possible) rather than starving synthesis. When `maxFiles` is smaller than the diff, source context is fetched for source/config files first, then docs/examples, then generated bundles and lockfiles.
 6. Writes report + manifest; prints disposition, SHA256, call/token/cost usage.
 
 **Disposition guards (deterministic, applied after model synthesis):**

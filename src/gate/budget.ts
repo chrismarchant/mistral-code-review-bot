@@ -56,6 +56,18 @@ export class Budget {
     }
   }
 
+  /**
+   * Non-throwing check: can a call with `promptText` be made while still
+   * leaving `reserveCalls` calls and `reserveTokens` tokens for later
+   * mandatory steps (i.e. the final synthesis)?
+   */
+  canAfford(promptText: string, reserveCalls = 0, reserveTokens = 0): boolean {
+    if (this.exhausted) return false;
+    const { maxModelCalls, tokenBudget } = this.profile.limits;
+    if (this.calls + 1 + reserveCalls > maxModelCalls) return false;
+    return this.totalTokens + this.estimateTokens(promptText) + reserveTokens <= tokenBudget;
+  }
+
   recordCall(promptText: string, usage?: {
     prompt_tokens?: number;
     completion_tokens?: number;
