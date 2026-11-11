@@ -16,6 +16,7 @@
     "build": "tsc -p tsconfig.json",
     "build:action": "npm run build && ncc build dist/github-action.js -o action",
     "start": "node -r dotenv/config dist/index.js",
+    "gate-review": "node dist/cli/gate-review.js",
     "test": "npm run build && node --test test/*.test.mjs"
   },
   "dependencies": {
