@@ -14,6 +14,8 @@ This is a Mistral-powered re-implementation of [anc95/ChatGPT-CodeReview](https:
    ```
 4. Each `hunk_header` is mapped to a line in the diff and posted as an inline review comment via `pulls.createReview`. Reviews whose hunk can't be located fall back to the PR review body. If nothing is found, the bot posts `LGTM 👍`.
 
+Reasoning models (e.g. `mistral-large-4-0`) return `message.content` as an array of blocks; only `text` blocks are used and `thinking` blocks are never posted. Fenced (```` ```json ````) or prose-wrapped JSON is tolerated; text that is not JSON is posted in the review body. Each file is reviewed independently: if a file's request fails, times out or returns no text, the other files are still reviewed and the failure is listed under **Files not reviewed** in the review body. The run fails only if every file fails or the review cannot be created.
+
 ## Using the GitHub Action
 
 1. Create a Mistral API key at <https://console.mistral.ai> and add it to your repo's **Actions secrets** as `MISTRAL_API_KEY` (or as a repo **variable** named `MISTRAL_API_KEY`).
@@ -78,6 +80,7 @@ docker run --env-file .env mistral-cr-bot
 | `LANGUAGE` | — | Language for the review comments |
 | `PROMPT` | built-in | Custom review instructions prepended to the diff |
 | `temperature` / `top_p` / `max_tokens` | `1` / `1` / — | Sampling parameters |
+| `REQUEST_TIMEOUT_MS` | `120000` | Timeout for each Mistral request, in milliseconds |
 | `MAX_PATCH_LENGTH` | unlimited | Skip files whose diff is larger than this |
 | `IGNORE_PATTERNS` / `INCLUDE_PATTERNS` | — | Comma-separated glob/regex file filters |
 | `TARGET_LABEL` | — | Only review PRs with this label |

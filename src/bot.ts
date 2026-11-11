@@ -1,7 +1,7 @@
 import { Context, Probot } from 'probot';
 import { minimatch } from 'minimatch';
 
-import { MistralChat } from './mistral.js';
+import { MistralChat, MistralNoTextError, Review } from './mistral.js';
 import log from './log.js';
 
 const MISTRAL_API_KEY = 'MISTRAL_API_KEY';
@@ -16,7 +16,7 @@ type PullRequestContext = Context<
 >;
 
 export const parseHunkHeader = (hunkHeader?: string) => {
-  if (!hunkHeader) {
+  if (!hunkHeader || typeof hunkHeader !== 'string') {
     return null;
   }
 
@@ -105,13 +105,160 @@ export const createInlineReviewComment = (
 
 export const createReviewBody = (
   hasInlineComments: boolean,
-  bodyComments: string[]
+  bodyComments: string[],
+  fileNotes: string[] = []
 ) => {
   const heading =
-    hasInlineComments || bodyComments.length
+    hasInlineComments || bodyComments.length || fileNotes.length
       ? 'Code review by Mistral'
       : 'LGTM 👍';
-  return [heading, ...bodyComments, REVIEW_MARKER].join('\n\n');
+  const notes = fileNotes.length
+    ? [`**Files not reviewed:**\n${fileNotes.map((n) => `- ${n}`).join('\n')}`]
+    : [];
+  return [heading, ...bodyComments, ...notes, REVIEW_MARKER].join('\n\n');
+};
+
+export interface InlineReviewComment {
+  path: string;
+  body: string;
+  line: number;
+  side: 'RIGHT' | 'LEFT';
+}
+
+const isNonEmptyString = (value: unknown): value is string =>
+  typeof value === 'string' && value.trim() !== '';
+
+/**
+ * Final guard before createReview: drops any comment whose body (or location)
+ * is not valid, so GitHub cannot reject the review with HTTP 422.
+ */
+export const sanitizeReviewComments = (
+  comments: unknown[]
+): InlineReviewComment[] =>
+  comments.filter((c): c is InlineReviewComment => {
+    const comment = c as Partial<InlineReviewComment> | null;
+    const valid =
+      !!comment &&
+      isNonEmptyString(comment.body) &&
+      isNonEmptyString(comment.path) &&
+      Number.isInteger(comment.line) &&
+      (comment.line as number) > 0 &&
+      (comment.side === 'RIGHT' || comment.side === 'LEFT');
+    if (!valid) {
+      log.error('dropping invalid inline review comment');
+    }
+    return valid;
+  });
+
+export const sanitizeReviewBody = (body: unknown): string =>
+  isNonEmptyString(body) ? body : `Code review by Mistral\n\n${REVIEW_MARKER}`;
+
+const escapeFilename = (filename: string) => filename.replace(/`/g, '\\`');
+
+const describeFailure = (err: unknown) => {
+  if (err instanceof MistralNoTextError) {
+    return err.message;
+  }
+  const name = (err as { name?: unknown } | null)?.name;
+  if (name === 'MistralTimeoutError') {
+    return (err as Error).message;
+  }
+  if (name === 'MistralHttpError') {
+    return `Mistral API request failed with status ${(err as { status?: number }).status}`;
+  }
+  return 'review failed (see the action log)';
+};
+
+export interface ReviewableFile {
+  filename: string;
+  status: string;
+  patch?: string;
+}
+
+export interface FileReviewResult {
+  comments: InlineReviewComment[];
+  bodyComments: string[];
+  fileNotes: string[];
+  attempted: number;
+  failed: number;
+}
+
+/**
+ * Reviews each file independently: a failure (HTTP error, timeout, no text,
+ * parse error) is recorded as a note and does not lose the other files.
+ */
+export const reviewFiles = async (
+  chat: { codeReview: (patch: string) => Promise<Review[] | Review> },
+  files: ReviewableFile[],
+  maxPatchLength: number = MAX_PATCH_COUNT
+): Promise<FileReviewResult> => {
+  const result: FileReviewResult = {
+    comments: [],
+    bodyComments: [],
+    fileNotes: [],
+    attempted: 0,
+    failed: 0,
+  };
+
+  for (const file of files) {
+    const patch = file.patch || '';
+
+    if (file.status !== 'modified' && file.status !== 'added') {
+      continue;
+    }
+
+    if (!patch || patch.length > maxPatchLength) {
+      log.info(`${file.filename} skipped caused by its diff is too large`);
+      continue;
+    }
+
+    result.attempted++;
+    const filename = escapeFilename(file.filename);
+    try {
+      const res = await chat.codeReview(patch);
+      // res can be a single review or an array of reviews (one for each hunk)
+      const reviews = Array.isArray(res) ? res : [res];
+
+      for (const review of reviews) {
+        if (!review || typeof review !== 'object' || review.lgtm) {
+          continue;
+        }
+        if (!isNonEmptyString(review.review_comment)) {
+          if (review.review_comment) {
+            log.error(`dropping non-string review comment for ${file.filename}`);
+          }
+          continue;
+        }
+        const inlineComment = review.raw
+          ? null
+          : createInlineReviewComment(
+              file.filename,
+              review.review_comment,
+              review.hunk_header,
+              patch
+            );
+        if (!inlineComment) {
+          result.bodyComments.push(
+            `**File:** \`${filename}\`\n\n${review.review_comment}`
+          );
+          if (!review.raw) {
+            log.error(
+              `Failed to locate inline review comment: ${review.hunk_header || 'missing hunk header'}`
+            );
+          }
+          continue;
+        }
+
+        result.comments.push(inlineComment);
+      }
+    } catch (e) {
+      result.failed++;
+      result.fileNotes.push(`\`${filename}\`: ${describeFailure(e)}`);
+      log.info(`review ${file.filename} failed`, e);
+    }
+  }
+
+  return result;
 };
 
 export const getChangedFiles = async (context: PullRequestContext) => {
@@ -362,75 +509,41 @@ export const robot = (app: Probot) => {
         return 'no change';
       }
 
+      log.info(
+        `reviewing ${changedFiles.length} file(s) with model ${chat.model} at head ${pull_request.head.sha}`
+      );
+
       console.time('mistral cost');
 
-      const ress: Array<{
-        path: string;
-        body: string;
-        line: number;
-        side: 'RIGHT' | 'LEFT';
-      }> = [];
-      const bodyComments: string[] = [];
+      const result = await reviewFiles(chat, changedFiles);
+      const comments = sanitizeReviewComments(result.comments);
+      const body = sanitizeReviewBody(
+        createReviewBody(
+          comments.length > 0,
+          result.bodyComments,
+          result.fileNotes
+        )
+      );
 
-      for (let i = 0; i < changedFiles.length; i++) {
-        const file = changedFiles[i];
-        const patch = file.patch || '';
-
-        if (file.status !== 'modified' && file.status !== 'added') {
-          continue;
-        }
-
-        if (!patch || patch.length > MAX_PATCH_COUNT) {
-          log.info(
-            `${file.filename} skipped caused by its diff is too large`
-          );
-          continue;
-        }
-        try {
-          const res = await chat.codeReview(patch);
-          // res can be a single review or an array of reviews (one for each hunk)
-          const reviews = Array.isArray(res) ? res : [res];
-
-          for (const review of reviews) {
-            if (!review.lgtm && !!review.review_comment) {
-              const inlineComment = createInlineReviewComment(
-                file.filename,
-                review.review_comment,
-                review.hunk_header,
-                patch
-              );
-              if (!inlineComment) {
-                const filename = file.filename.replace(/`/g, '\\`');
-                bodyComments.push(
-                  `**File:** \`${filename}\`\n\n${review.review_comment}`
-                );
-                log.error(
-                  `Failed to locate inline review comment: ${review.hunk_header || 'missing hunk header'}`
-                );
-                continue;
-              }
-
-              ress.push(inlineComment);
-            }
-          }
-        } catch (e) {
-          log.info(`review ${file.filename} failed`, e);
-          throw e;
-        }
-      }
       try {
         await context.octokit.pulls.createReview({
           repo: repo.repo,
           owner: repo.owner,
           pull_number: context.pullRequest().pull_number,
-          body: createReviewBody(ress.length > 0, bodyComments),
+          body,
           event: 'COMMENT',
           commit_id: context.payload.pull_request.head.sha,
-          comments: ress,
+          comments,
         });
       } catch (e) {
         log.info(`Failed to create review`, e);
         throw e;
+      }
+
+      if (result.attempted > 0 && result.failed === result.attempted) {
+        throw new Error(
+          `All ${result.attempted} file review(s) failed; see the review body and log`
+        );
       }
 
       console.timeEnd('mistral cost');
