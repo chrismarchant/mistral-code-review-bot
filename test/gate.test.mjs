@@ -426,3 +426,52 @@ test('app installation tokens resolve to Bot identity via GET /app', async () =>
   assert.equal(identity.type, 'Bot');
   assert.equal(identity.slug, 'mcrb-gate');
 });
+
+test('appauth: minted JWT is RS256, iss=appId, exp-iat<=600s, and verifies against the public key', async () => {
+  const { mintAppJwt, _testGenerateKeyPair } = await import('../dist/gate/appauth.js');
+  const { privateKey, publicKey } = _testGenerateKeyPair();
+  const pem = privateKey.export({ type: 'pkcs8', format: 'pem' }).toString();
+  const jwt = mintAppJwt('123456', pem, Date.now());
+  const [h, p, s] = jwt.split('.');
+  assert.equal(JSON.parse(Buffer.from(h, 'base64url').toString()).alg, 'RS256');
+  const payload = JSON.parse(Buffer.from(p, 'base64url').toString());
+  assert.equal(payload.iss, '123456');
+  assert.ok(payload.exp - payload.iat <= 600);
+  const { createVerify } = await import('node:crypto');
+  const v = createVerify('RSA-SHA256');
+  v.update(`${h}.${p}`);
+  assert.ok(v.verify(publicKey, s, 'base64url'), 'signature must verify');
+});
+
+test('appauth: installation token flow resolves app slug and exchanges for token', async () => {
+  const { getInstallationToken, _testGenerateKeyPair } = await import('../dist/gate/appauth.js');
+  const { privateKey } = _testGenerateKeyPair();
+  const pem = privateKey.export({ type: 'pkcs8', format: 'pem' }).toString();
+  const calls = [];
+  const fetchImpl = async (url, init) => {
+    calls.push({ method: init.method, url });
+    const ok = (data, status = 200) => ({ ok: status < 300, status, json: async () => data, text: async () => '' });
+    if (url.endsWith('/app')) return ok({ slug: 'mcrb-gate-review', id: 999 });
+    if (url.includes('/repos/octo/demo/installation')) return ok({ id: 555 });
+    if (url.includes('/app/installations/555/access_tokens')) return ok({ token: 'ghs_secret_token' }, 201);
+    return ok({ message: 'nope' }, 404);
+  };
+  const res = await getInstallationToken({ appId: '123456', privateKeyPem: pem }, 'octo', 'demo', fetchImpl);
+  assert.equal(res.token, 'ghs_secret_token');
+  assert.equal(res.installationId, 555);
+  assert.equal(res.appSlug, 'mcrb-gate-review');
+  assert.ok(calls.every((c) => c.url.startsWith('https://api.github.com')));
+});
+
+test('getViewerIdentity falls back to GET /installation for installation tokens', async () => {
+  const gh = makeGithubFetch({
+    '/user': { ok: false, status: 403, json: async () => ({}), text: async () => 'forbidden' },
+    '/app': { ok: false, status: 401, json: async () => ({}), text: async () => 'jwt required' },
+    '/installation': okJson({ id: 555, app_id: 999, app_slug: 'mcrb-gate-review' }),
+  });
+  const github = makeGithub(gh.fetchImpl);
+  const identity = await github.getViewerIdentity();
+  assert.equal(identity.type, 'Bot');
+  assert.equal(identity.slug, 'mcrb-gate-review');
+  assert.equal(identity.source, 'GET /installation');
+});

@@ -40,9 +40,12 @@ Parameters may also come from env: `GATE_OWNER`, `GATE_REPO`, `GATE_PR`, `GATE_B
 | Env var | Purpose |
 | --- | --- |
 | `GITHUB_TOKEN` | GitHub token (PAT fine-grained or Actions token). Read-only scopes for review: `contents: read`, `pull-requests: read`, `checks: read`, `actions: read`, `security-events: read` (optional), `dependency-graph: read` (optional), `metadata: read`. Publication additionally needs `pull-requests: write`. |
+| `GITHUB_APP_ID` + `GITHUB_APP_PRIVATE_KEY` | **preferred for production.** When both are set, the CLI mints an app JWT (RS256), resolves the app installation for the target repo, and exchanges it for an installation token — the review then runs as the App's Bot and the manifest records `reviewerIdentity: {type: "Bot", slug: …}`. |
 | `MISTRAL_API_KEY` | Mistral API key (`https://console.mistral.ai`) |
 | `MODEL` | optional, default `mistral-large-latest` |
-| `GITHUB_APP_SLUG` | optional, recorded in provenance when running as a GitHub App |
+| `GITHUB_APP_SLUG` | optional fallback label for provenance when the token cannot self-describe |
+
+**GitHub App setup (one-time, manual):** GitHub no longer supports headless App *creation* via the REST API (`POST /user/apps` removed; the app-manifest flow is scoped to a browser session — verified: both return 404 with an OAuth token). Register the app once at `https://github.com/settings/apps/new` (or `https://github.com/organizations/<org>/settings/apps/new`), grant read-only permissions (`contents`, `pull-requests`, `checks`, `actions`, `metadata`; add `security-events`/`dependency-graph` optionally; `pull-requests: write` only if you intend to `--publish`), install it on the target repo, then set `GITHUB_APP_ID` and `GITHUB_APP_PRIVATE_KEY` (the PEM) in the environment. The bot mints short-lived JWTs itself; the private key never enters any artifact.
 
 Never place tokens in artifacts; the bot writes none of them into report/manifest.
 
@@ -71,7 +74,7 @@ Verify independently: `sha256sum report.md` must equal `manifest.reportSha256`.
 - synthesis missing/malformed ⇒ REJECT (incomplete reviews never pass)
 - any unresolved evidence item or coverage gap (omitted patches, GitHub 300-file cap, context-budget skips, non-`ahead` compare status) ⇒ ACCEPT is downgraded to ACCEPT WITH CONDITIONS, never unconditional
 
-**Reviewer identity:** the CLI resolves the token's identity live (`GET /user` → User, else `GET /app` → App Bot) and records it in `manifest.execution.reviewerIdentity` with an independence note: the bot — not its implementation session — is the reviewer.
+**Reviewer identity:** the CLI resolves the token's identity live (`GET /user` → User; `GET /app` with app JWT → App Bot; `GET /installation` fallback for installation tokens) and records it in `manifest.execution.reviewerIdentity` with an independence note: the bot — not its implementation session — is the reviewer. With `GITHUB_APP_ID`/`GITHUB_APP_PRIVATE_KEY` set, the slug is taken from the app-auth flow itself.
 
 ## 7. Failure / exit codes
 

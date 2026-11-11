@@ -362,7 +362,23 @@ export class GitHubEvidence {
         const a = (await this.getJson('/app')) as Record<string, any>;
         return { type: 'Bot', slug: a.slug, name: a.name, source: 'GET /app' };
       } catch {
-        return { type: 'unknown', source: 'GET /user and GET /app both failed' };
+        try {
+          // installation tokens cannot call GET /app (JWT-only); try the
+          // installation resource instead
+          const inst = (await this.getJson('/installation')) as Record<string, any>;
+          return {
+            type: 'Bot',
+            slug: inst.app_slug ?? null,
+            appId: inst.app_id ?? null,
+            installationId: inst.id ?? null,
+            source: 'GET /installation',
+          };
+        } catch {
+          return {
+            type: 'unknown',
+            source: 'GET /user, GET /app and GET /installation all failed; set GITHUB_APP_SLUG to label provenance',
+          };
+        }
       }
     }
   };

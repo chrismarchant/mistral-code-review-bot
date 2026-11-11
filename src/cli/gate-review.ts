@@ -17,6 +17,7 @@ import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 
+import { getInstallationToken } from '../gate/appauth.js';
 import { GitHubEvidence } from '../gate/github.js';
 import { loadProfile } from '../gate/profile.js';
 import { publishGateReview } from '../gate/publish.js';
@@ -80,12 +81,38 @@ const main = async () => {
     ['--base', base],
     ['--head', head],
   ].filter(([, v]) => v === undefined || v === '');
-  const token = process.env.GITHUB_TOKEN;
   const mistralKey = process.env.MISTRAL_API_KEY;
-  if (missing.length || !token || !mistralKey) {
+  if (missing.length || !mistralKey) {
     console.error(
-      'Missing required inputs. Provide --owner --repo --pr --base --head and env GITHUB_TOKEN + MISTRAL_API_KEY.'
+      'Missing required inputs. Provide --owner --repo --pr --base --head and env MISTRAL_API_KEY plus GITHUB_TOKEN or GITHUB_APP_ID+GITHUB_APP_PRIVATE_KEY.'
     );
+    process.exit(2);
+  }
+
+  // GitHub identity: prefer a GitHub App installation token (Bot identity) when
+  // app credentials are provided; otherwise fall back to a plain GITHUB_TOKEN.
+  let token = process.env.GITHUB_TOKEN;
+  let appSlug: string | null = null;
+  if (process.env.GITHUB_APP_ID && process.env.GITHUB_APP_PRIVATE_KEY) {
+    try {
+      const inst = await getInstallationToken(
+        {
+          appId: process.env.GITHUB_APP_ID,
+          privateKeyPem: process.env.GITHUB_APP_PRIVATE_KEY,
+        },
+        owner!,
+        repo!
+      );
+      token = inst.token;
+      appSlug = inst.appSlug;
+      console.log(`[gate-review] using GitHub App installation token (app slug: ${inst.appSlug}, installation ${inst.installationId})`);
+    } catch (e) {
+      console.error('[gate-review] GitHub App authentication failed:', e);
+      process.exit(4);
+    }
+  }
+  if (!token) {
+    console.error('Missing required inputs. Provide GITHUB_TOKEN or GITHUB_APP_ID+GITHUB_APP_PRIVATE_KEY.');
     process.exit(2);
   }
 
@@ -110,10 +137,18 @@ const main = async () => {
 
   // establish the ACTUAL GitHub identity behind the token (User vs App Bot)
   const reviewerIdentity = await github.getViewerIdentity();
+  if (appSlug && reviewerIdentity.type !== 'Bot') {
+    // installation tokens cannot always self-describe; we know the app slug
+    reviewerIdentity.type = 'Bot';
+    reviewerIdentity.slug = appSlug;
+    reviewerIdentity.source = 'appauth (GET /app with app JWT)';
+  }
   const provenance = {
     reviewerIdentity,
     githubAppSlug:
-      reviewerIdentity.type === 'Bot' ? reviewerIdentity.slug : process.env.GITHUB_APP_SLUG ?? null,
+      reviewerIdentity.type === 'Bot'
+        ? (reviewerIdentity.slug as string) ?? process.env.GITHUB_APP_SLUG ?? null
+        : process.env.GITHUB_APP_SLUG ?? null,
     tokenType:
       reviewerIdentity.type === 'Bot' ? 'github-app-installation' : 'oauth-or-PAT',
     invokedVia: 'cli',
