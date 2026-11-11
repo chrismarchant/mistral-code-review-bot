@@ -170350,25 +170350,10 @@ class MistralChat {
             'Ensure your response is a valid JSON object with a reviews array.\n';
         return `${userPrompt}${jsonFormatRequirement} ${answerLanguage}:\n    ${patch}\n    `;
     };
-    codeReview = async (patch) => {
-        if (!patch) {
-            return { lgtm: true, review_comment: '' };
-        }
-        console.time('code-review cost');
-        const prompt = this.generatePrompt(patch);
-        const temperature = process.env.temperature !== undefined ? +process.env.temperature : 1;
-        const topP = process.env.top_p !== undefined ? +process.env.top_p : 1;
+    request = async (body) => {
         const timeoutMs = +(process.env.REQUEST_TIMEOUT_MS || 120_000);
         const maxAttempts = Math.max(1, +(process.env.RETRY_ATTEMPTS || 3));
         const baseDelayMs = +(process.env.RETRY_BASE_DELAY_MS || 500);
-        const body = JSON.stringify({
-            model: this.model,
-            messages: [{ role: 'user', content: prompt }],
-            temperature,
-            top_p: topP,
-            ...(process.env.max_tokens ? { max_tokens: +process.env.max_tokens } : {}),
-            response_format: { type: 'json_object' },
-        });
         let lastError;
         for (let attempt = 1; attempt <= maxAttempts; attempt++) {
             try {
@@ -170378,7 +170363,7 @@ class MistralChat {
                         'Content-Type': 'application/json',
                         Authorization: `Bearer ${this.apiKey}`,
                     },
-                    body,
+                    body: JSON.stringify(body),
                     signal: AbortSignal.timeout(timeoutMs),
                 });
                 if (!res.ok) {
@@ -170386,27 +170371,10 @@ class MistralChat {
                     throw new ApiError(res.status, `Mistral API request failed with status ${res.status}: ${text}`);
                 }
                 const data = (await res.json());
-                const content = data.choices?.[0]?.message?.content || '';
-                console.timeEnd('code-review cost');
-                if (content) {
-                    try {
-                        const json = JSON.parse(content);
-                        if (json.reviews && Array.isArray(json.reviews)) {
-                            return json.reviews;
-                        }
-                        return json;
-                    }
-                    catch {
-                        // Model did not return valid JSON: keep the raw text as a single review.
-                        const firstLine = patch.split('\n')[0];
-                        return {
-                            lgtm: false,
-                            hunk_header: firstLine.startsWith('@@') ? firstLine : undefined,
-                            review_comment: content,
-                        };
-                    }
-                }
-                return { lgtm: true, review_comment: '' };
+                return {
+                    content: data.choices?.[0]?.message?.content || '',
+                    usage: data.usage,
+                };
             }
             catch (e) {
                 lastError = e;
@@ -170418,8 +170386,52 @@ class MistralChat {
                 break;
             }
         }
-        console.timeEnd('code-review cost');
         throw lastError;
+    };
+    /**
+     * Generic chat call (used by the gate-review mode). Supports JSON mode.
+     */
+    chat = async (messages, opts = {}) => {
+        const temperature = process.env.temperature !== undefined ? +process.env.temperature : 1;
+        const topP = process.env.top_p !== undefined ? +process.env.top_p : 1;
+        return this.request({
+            model: this.model,
+            messages,
+            temperature,
+            top_p: topP,
+            ...(process.env.max_tokens || opts.maxTokens
+                ? { max_tokens: opts.maxTokens ?? +process.env.max_tokens }
+                : {}),
+            ...(opts.json ? { response_format: { type: 'json_object' } } : {}),
+        });
+    };
+    codeReview = async (patch) => {
+        if (!patch) {
+            return { lgtm: true, review_comment: '' };
+        }
+        console.time('code-review cost');
+        const prompt = this.generatePrompt(patch);
+        const { content } = await this.chat([{ role: 'user', content: prompt }], { json: true });
+        console.timeEnd('code-review cost');
+        if (content) {
+            try {
+                const json = JSON.parse(content);
+                if (json.reviews && Array.isArray(json.reviews)) {
+                    return json.reviews;
+                }
+                return json;
+            }
+            catch {
+                // Model did not return valid JSON: keep the raw text as a single review.
+                const firstLine = patch.split('\n')[0];
+                return {
+                    lgtm: false,
+                    hunk_header: firstLine.startsWith('@@') ? firstLine : undefined,
+                    review_comment: content,
+                };
+            }
+        }
+        return { lgtm: true, review_comment: '' };
     };
 }
 

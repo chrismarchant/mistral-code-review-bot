@@ -1,0 +1,20 @@
+{
+  "schema": "mcrb.gate.profile.v1",
+  "description": "Default gate-review profile: bounded, read-only comprehensive review",
+  "limits": {
+    "maxFiles": 50,
+    "maxContextCharsPerFile": 20000,
+    "maxContextCharsTotal": 200000,
+    "maxModelCalls": 8,
+    "maxPromptCharsPerCall": 120000,
+    "tokenBudget": 400000,
+    "requestTimeoutMs": 120000,
+    "retryAttempts": 3,
+    "chunkMaxLines": 200
+  },
+  "pricesPerMillionTokens": {
+    "input": 2.0,
+    "output": 8.0
+  },
+  "notes": "prices are USD per 1M tokens used only for cost estimation; override per model"
+}

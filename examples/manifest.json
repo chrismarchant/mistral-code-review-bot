@@ -1,0 +1,166 @@
+{
+  "schema": "mcrb.gate.manifest.v1",
+  "generatedAt": "2026-01-01T00:00:00.000Z",
+  "execution": {
+    "id": "example-exec-0001",
+    "reviewer": "mistral-code-review-bot/gate-review",
+    "reviewerVersion": "1.0.0",
+    "mode": "gate-review (read-only)",
+    "provenance": {
+      "tokenType": "GITHUB_TOKEN",
+      "invokedVia": "cli (example, mocked APIs)"
+    }
+  },
+  "repository": {
+    "owner": "octo",
+    "repo": "demo",
+    "pr": 7,
+    "htmlUrl": "https://github.com/octo/demo/pull/7"
+  },
+  "commits": {
+    "baseline": "1111111111111111111111111111111111111111",
+    "candidate": "2222222222222222222222222222222222222222",
+    "candidateVerifiedAgainstPrHead": true
+  },
+  "model": {
+    "provider": "mistral",
+    "model": "mistral-large-latest",
+    "callsUsed": 5,
+    "tokenUsage": {
+      "prompt": 21000,
+      "completion": 3500,
+      "total": 24500,
+      "budget": 400000
+    },
+    "estimatedCostUsd": 0.07
+  },
+  "profile": {
+    "schema": "mcrb.gate.profile.v1",
+    "description": "built-in default gate-review profile",
+    "limits": {
+      "maxFiles": 50,
+      "maxContextCharsPerFile": 20000,
+      "maxContextCharsTotal": 200000,
+      "maxModelCalls": 8,
+      "maxPromptCharsPerCall": 120000,
+      "tokenBudget": 400000,
+      "requestTimeoutMs": 120000,
+      "retryAttempts": 3,
+      "chunkMaxLines": 200
+    },
+    "pricesPerMillionTokens": {
+      "input": 2,
+      "output": 8
+    }
+  },
+  "evidence": [
+    {
+      "id": "pr-meta",
+      "category": "pr",
+      "kind": "verified",
+      "ref": "GET /repos/{owner}/{repo}/pulls/7",
+      "summary": "PR #7 \"Refactor auth module\" by dev1; state=open; draft=false; head=2222222222222222222222222222222222222222; base=1111111111111111111111111111111111111111",
+      "truncated": false
+    },
+    {
+      "id": "diff-summary",
+      "category": "diff",
+      "kind": "verified",
+      "ref": "GET /repos/octo/demo/compare/1111111111111111111111111111111111111111...2222222222222222222222222222222222222222",
+      "summary": "compare 1111111111111111111111111111111111111111...2222222222222222222222222222222222222222: status=ahead, ahead_by=3, commits=3, files=1",
+      "truncated": false
+    },
+    {
+      "id": "src:src/auth.ts",
+      "category": "source",
+      "kind": "verified",
+      "ref": "GET /repos/{owner}/{repo}/contents/src/auth.ts?ref=2222222222222222222222222222222222222222",
+      "summary": "src/auth.ts at 2222222222222222222222222222222222222222 (120 bytes)",
+      "truncated": false
+    },
+    {
+      "id": "ci-check-runs",
+      "category": "ci",
+      "kind": "verified",
+      "ref": "GET /repos/{owner}/{repo}/commits/2222222222222222222222222222222222222222/check-runs",
+      "summary": "2 check run(s) for 2222222222222222222222222222222222222222: build: completed/success; test: completed/failure",
+      "truncated": false
+    },
+    {
+      "id": "ci-workflow-runs",
+      "category": "ci",
+      "kind": "verified",
+      "ref": "GET /repos/{owner}/{repo}/actions/runs?head_sha=2222222222222222222222222222222222222222",
+      "summary": "1 workflow run(s) for 2222222222222222222222222222222222222222: CI (1): completed/failure",
+      "truncated": false
+    },
+    {
+      "id": "dep-sbom",
+      "category": "dependency",
+      "kind": "unresolved",
+      "ref": "GET /repos/{owner}/{repo}/dependency-graph/sbom",
+      "summary": "SBOM unavailable (needs dependency-graph read): GitHub API /repos/octo/demo/dependency-graph/sbom -> 404: {\"message\":\"Not Found\"}",
+      "truncated": false
+    },
+    {
+      "id": "dep-lock-package-lock.json",
+      "category": "dependency",
+      "kind": "verified",
+      "ref": "GET /repos/{owner}/{repo}/contents/package-lock.json?ref=2222222222222222222222222222222222222222",
+      "summary": "package-lock.json (120 bytes) at 2222222222222222222222222222222222222222",
+      "truncated": false
+    },
+    {
+      "id": "sec-dependabot-open",
+      "category": "security",
+      "kind": "verified",
+      "ref": "GET /repos/{owner}/{repo}/dependabot/alerts?state=open",
+      "summary": "1 open Dependabot alert(s)",
+      "truncated": false
+    },
+    {
+      "id": "sec-vulnerability-alerts-enabled",
+      "category": "security",
+      "kind": "verified",
+      "ref": "GET /repos/{owner}/{repo}/vulnerability-alerts",
+      "summary": "repository vulnerability alerts are ENABLED",
+      "truncated": false
+    }
+  ],
+  "checks": {
+    "filesInspected": 1,
+    "readOnly": true
+  },
+  "findings": [
+    {
+      "id": "F-1",
+      "severity": "high",
+      "category": "security",
+      "title": "Open high-severity dependency advisory (lodash)",
+      "detail": "Upgrade lodash to a patched version before merge.",
+      "evidenceRefs": [
+        "sec-dependabot-open"
+      ]
+    },
+    {
+      "id": "F-2",
+      "severity": "medium",
+      "category": "regression",
+      "title": "CI failing on candidate head",
+      "detail": "check-runs report test failure for the candidate SHA.",
+      "evidenceRefs": [
+        "ci-check-runs"
+      ]
+    }
+  ],
+  "missingEvidence": [
+    "dep-sbom"
+  ],
+  "coverageLimitations": [
+    "SBOM unavailable; lockfile used instead"
+  ],
+  "disposition": "ACCEPT WITH CONDITIONS",
+  "rationale": "Acceptable once the lodash advisory is addressed and CI is green.",
+  "reportFile": "report.md",
+  "reportSha256": "f41eab29dada3f361dcb29c3cb22a512ec589cee6e6cbf69bedc0599a079cc35"
+}

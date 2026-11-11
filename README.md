@@ -91,6 +91,18 @@ docker run --env-file .env mistral-cr-bot
 
 Files in a PR are reviewed **in parallel**, bounded by `MAX_CONCURRENCY` (a semaphore shared across all files). Large diffs are additionally split into hunk-level chunks (`CHUNK_MAX_LINES`) that are also reviewed in parallel, then merged — hunk headers stay verbatim, so inline comment mapping still works. Each request has its own timeout and is retried with exponential backoff + jitter on 429/5xx/network errors; a file that ultimately fails is reported in the review body instead of failing the whole PR. For rapid pushes, add `concurrency: { group: pr-${{ github.event.pull_request.number }}, cancel-in-progress: true }` to your workflow so stale runs are cancelled.
 
+## Gate Review (Mode B — manual, comprehensive, read-only)
+
+In addition to the event-driven inline review (Mode A), the bot ships an on-demand **gate review** CLI for independent, evidence-backed acceptance reviews:
+
+```bash
+npm run build
+npm run gate-review -- --owner ORG --repo REPO --pr 123 --base <base-sha> --head <head-sha> \
+  [--profile profiles/gate-review.v1.json] [--out DIR] [--publish]
+```
+
+It verifies the candidate SHA against the PR head (draft PRs supported), retrieves the full baseline→candidate diff plus source context and CI/dependency/security evidence (read-only GETs), runs a bounded multi-call Mistral assessment, and writes `report.md` + `manifest.json` (schema `mcrb.gate.*.v1`, SHA256-verified). `--publish` is a separate explicit operation that posts a COMMENT review (never APPROVE) bound to the candidate commit, with duplicate protection. See [docs/CONSUMER-CONTRACT.md](docs/CONSUMER-CONTRACT.md) for the full consumer contract and [examples/](examples/) for example artifacts.
+
 ## Development
 
 ```bash
