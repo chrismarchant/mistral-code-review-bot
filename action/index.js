@@ -170298,9 +170298,21 @@ minimatch.unescape = unescape_unescape;
 ;// CONCATENATED MODULE: ./dist/mistral.js
 const DEFAULT_ENDPOINT = 'https://api.mistral.ai/v1';
 const DEFAULT_MODEL = 'mistral-large-latest';
+class ApiError extends Error {
+    status;
+    constructor(status, message) {
+        super(message);
+        this.status = status;
+        this.name = 'ApiError';
+    }
+}
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 /**
  * Minimal client for the Mistral chat completions API
  * (OpenAI-compatible: POST {endpoint}/chat/completions).
+ *
+ * Each request gets its own timeout and is retried with exponential
+ * backoff + jitter on 429/5xx and network errors.
  */
 class MistralChat {
     apiKey;
@@ -170346,48 +170358,68 @@ class MistralChat {
         const prompt = this.generatePrompt(patch);
         const temperature = process.env.temperature !== undefined ? +process.env.temperature : 1;
         const topP = process.env.top_p !== undefined ? +process.env.top_p : 1;
-        const res = await this.fetchImpl(`${this.endpoint}/chat/completions`, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-                Authorization: `Bearer ${this.apiKey}`,
-            },
-            body: JSON.stringify({
-                model: this.model,
-                messages: [{ role: 'user', content: prompt }],
-                temperature,
-                top_p: topP,
-                ...(process.env.max_tokens
-                    ? { max_tokens: +process.env.max_tokens }
-                    : {}),
-                response_format: { type: 'json_object' },
-            }),
+        const timeoutMs = +(process.env.REQUEST_TIMEOUT_MS || 120_000);
+        const maxAttempts = Math.max(1, +(process.env.RETRY_ATTEMPTS || 3));
+        const baseDelayMs = +(process.env.RETRY_BASE_DELAY_MS || 500);
+        const body = JSON.stringify({
+            model: this.model,
+            messages: [{ role: 'user', content: prompt }],
+            temperature,
+            top_p: topP,
+            ...(process.env.max_tokens ? { max_tokens: +process.env.max_tokens } : {}),
+            response_format: { type: 'json_object' },
         });
-        console.timeEnd('code-review cost');
-        if (!res.ok) {
-            throw new Error(`Mistral API request failed with status ${res.status}: ${await res.text()}`);
-        }
-        const data = (await res.json());
-        const content = data.choices?.[0]?.message?.content || '';
-        if (content) {
+        let lastError;
+        for (let attempt = 1; attempt <= maxAttempts; attempt++) {
             try {
-                const json = JSON.parse(content);
-                if (json.reviews && Array.isArray(json.reviews)) {
-                    return json.reviews;
+                const res = await this.fetchImpl(`${this.endpoint}/chat/completions`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        Authorization: `Bearer ${this.apiKey}`,
+                    },
+                    body,
+                    signal: AbortSignal.timeout(timeoutMs),
+                });
+                if (!res.ok) {
+                    const text = await res.text();
+                    throw new ApiError(res.status, `Mistral API request failed with status ${res.status}: ${text}`);
                 }
-                return json;
+                const data = (await res.json());
+                const content = data.choices?.[0]?.message?.content || '';
+                console.timeEnd('code-review cost');
+                if (content) {
+                    try {
+                        const json = JSON.parse(content);
+                        if (json.reviews && Array.isArray(json.reviews)) {
+                            return json.reviews;
+                        }
+                        return json;
+                    }
+                    catch {
+                        // Model did not return valid JSON: keep the raw text as a single review.
+                        const firstLine = patch.split('\n')[0];
+                        return {
+                            lgtm: false,
+                            hunk_header: firstLine.startsWith('@@') ? firstLine : undefined,
+                            review_comment: content,
+                        };
+                    }
+                }
+                return { lgtm: true, review_comment: '' };
             }
-            catch {
-                // Model did not return valid JSON: keep the raw text as a single review.
-                const firstLine = patch.split('\n')[0];
-                return {
-                    lgtm: false,
-                    hunk_header: firstLine.startsWith('@@') ? firstLine : undefined,
-                    review_comment: content,
-                };
+            catch (e) {
+                lastError = e;
+                const retryable = !(e instanceof ApiError) || e.status === 429 || e.status >= 500;
+                if (retryable && attempt < maxAttempts) {
+                    await sleep(baseDelayMs * 2 ** (attempt - 1) + Math.random() * baseDelayMs);
+                    continue;
+                }
+                break;
             }
         }
-        return { lgtm: true, review_comment: '' };
+        console.timeEnd('code-review cost');
+        throw lastError;
     };
 }
 
@@ -170582,6 +170614,100 @@ const matchPatterns = (patterns, path) => {
         }
     });
 };
+/**
+ * Limits how many async tasks run at once (used to cap concurrent
+ * Mistral API calls across all files/chunks of a PR).
+ */
+class Semaphore {
+    limit;
+    active = 0;
+    queue = [];
+    constructor(limit) {
+        this.limit = limit;
+        this.limit = Math.max(1, limit);
+    }
+    async run(fn) {
+        if (this.active >= this.limit) {
+            await new Promise((resolve) => this.queue.push(resolve));
+        }
+        this.active++;
+        try {
+            return await fn();
+        }
+        finally {
+            this.active--;
+            const next = this.queue.shift();
+            if (next)
+                next();
+        }
+    }
+}
+/**
+ * Splits a unified diff into chunks that each keep the file header
+ * (diff --git / index / --- / +++ lines) followed by one or more whole
+ * hunks, so every chunk is a valid self-contained patch and hunk headers
+ * stay verbatim. Chunks are capped at maxLinesPerChunk hunk lines.
+ */
+const splitPatchIntoChunks = (patch, maxLinesPerChunk = Math.max(1, +(process.env.CHUNK_MAX_LINES || 200))) => {
+    const lines = patch.split('\n');
+    const header = [];
+    const hunkGroups = [];
+    let current = null;
+    for (const line of lines) {
+        if (line.startsWith('@@')) {
+            current = [line];
+            hunkGroups.push(current);
+        }
+        else if (current) {
+            current.push(line);
+        }
+        else {
+            header.push(line);
+        }
+    }
+    if (!hunkGroups.length) {
+        return [patch];
+    }
+    const chunks = [];
+    let buf = [...header];
+    for (const group of hunkGroups) {
+        if (buf.length > header.length &&
+            buf.length - header.length >= maxLinesPerChunk) {
+            chunks.push(buf.join('\n'));
+            buf = [...header];
+        }
+        buf.push(...group);
+    }
+    if (buf.length > header.length) {
+        chunks.push(buf.join('\n'));
+    }
+    return chunks.length ? chunks : [patch];
+};
+/**
+ * Reviews a single file's patch: splits it into hunk chunks, sends each
+ * chunk to the model under the shared concurrency limit, and maps the
+ * returned reviews to inline comments (falling back to body comments).
+ */
+const reviewFilePatch = async (chat, filename, patch, semaphore, maxLinesPerChunk) => {
+    const chunks = splitPatchIntoChunks(patch, maxLinesPerChunk);
+    const chunkResults = await Promise.all(chunks.map((chunk) => semaphore.run(() => chat.codeReview(chunk))));
+    const reviews = chunkResults.flatMap((r) => (Array.isArray(r) ? r : [r]));
+    const inline = [];
+    const body = [];
+    for (const review of reviews) {
+        if (!review.lgtm && !!review.review_comment) {
+            const inlineComment = createInlineReviewComment(filename, review.review_comment, review.hunk_header, patch);
+            if (!inlineComment) {
+                const safeName = filename.replace(/`/g, '\\`');
+                body.push(`**File:** \`${safeName}\`\n\n${review.review_comment}`);
+                log.error(`Failed to locate inline review comment: ${review.hunk_header || 'missing hunk header'}`);
+                continue;
+            }
+            inline.push(inlineComment);
+        }
+    }
+    return { inline, body };
+};
 const robot = (app) => {
     if (process.env.GITHUB_ACTIONS === 'true') {
         app.onError(() => {
@@ -170669,40 +170795,42 @@ const robot = (app) => {
             return 'no change';
         }
         console.time('mistral cost');
-        const ress = [];
-        const bodyComments = [];
-        for (let i = 0; i < changedFiles.length; i++) {
-            const file = changedFiles[i];
+        const semaphore = new Semaphore(Math.max(1, +(process.env.MAX_CONCURRENCY || 5)));
+        const reviewTasks = changedFiles
+            .filter((file) => {
             const patch = file.patch || '';
             if (file.status !== 'modified' && file.status !== 'added') {
-                continue;
+                return false;
             }
-            if (!patch || patch.length > MAX_PATCH_COUNT) {
+            if (!patch) {
+                return false;
+            }
+            if (patch.length > MAX_PATCH_COUNT) {
                 log.info(`${file.filename} skipped caused by its diff is too large`);
-                continue;
+                return false;
             }
+            return true;
+        })
+            .map((file) => async () => {
             try {
-                const res = await chat.codeReview(patch);
-                // res can be a single review or an array of reviews (one for each hunk)
-                const reviews = Array.isArray(res) ? res : [res];
-                for (const review of reviews) {
-                    if (!review.lgtm && !!review.review_comment) {
-                        const inlineComment = createInlineReviewComment(file.filename, review.review_comment, review.hunk_header, patch);
-                        if (!inlineComment) {
-                            const filename = file.filename.replace(/`/g, '\\`');
-                            bodyComments.push(`**File:** \`${filename}\`\n\n${review.review_comment}`);
-                            log.error(`Failed to locate inline review comment: ${review.hunk_header || 'missing hunk header'}`);
-                            continue;
-                        }
-                        ress.push(inlineComment);
-                    }
-                }
+                return await reviewFilePatch(chat, file.filename, file.patch || '', semaphore);
             }
             catch (e) {
+                // one file failing must not fail the whole review
                 log.info(`review ${file.filename} failed`, e);
-                throw e;
+                const safeName = file.filename.replace(/`/g, '\\`');
+                return {
+                    inline: [],
+                    body: [
+                        `**File:** \`${safeName}\`\n\n⚠️ review failed: ${e.message}`,
+                    ],
+                };
             }
-        }
+        });
+        // review all files concurrently (bounded by the semaphore)
+        const results = await Promise.all(reviewTasks.map((task) => task()));
+        const ress = results.flatMap((r) => r.inline);
+        const bodyComments = results.flatMap((r) => r.body);
         try {
             await context.octokit.pulls.createReview({
                 repo: repo.repo,

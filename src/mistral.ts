@@ -10,6 +10,7 @@ export type FetchLike = (
     method: string;
     headers: Record<string, string>;
     body: string;
+    signal?: AbortSignal;
   }
 ) => Promise<{
   ok: boolean;
@@ -21,9 +22,24 @@ export type FetchLike = (
 const DEFAULT_ENDPOINT = 'https://api.mistral.ai/v1';
 const DEFAULT_MODEL = 'mistral-large-latest';
 
+class ApiError extends Error {
+  constructor(
+    public status: number,
+    message: string
+  ) {
+    super(message);
+    this.name = 'ApiError';
+  }
+}
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
 /**
  * Minimal client for the Mistral chat completions API
  * (OpenAI-compatible: POST {endpoint}/chat/completions).
+ *
+ * Each request gets its own timeout and is retried with exponential
+ * backoff + jitter on 429/5xx and network errors.
  */
 export class MistralChat {
   private apiKey: string;
@@ -84,56 +100,81 @@ export class MistralChat {
     const temperature =
       process.env.temperature !== undefined ? +process.env.temperature : 1;
     const topP = process.env.top_p !== undefined ? +process.env.top_p : 1;
+    const timeoutMs = +(process.env.REQUEST_TIMEOUT_MS || 120_000);
+    const maxAttempts = Math.max(1, +(process.env.RETRY_ATTEMPTS || 3));
+    const baseDelayMs = +(process.env.RETRY_BASE_DELAY_MS || 500);
 
-    const res = await this.fetchImpl(`${this.endpoint}/chat/completions`, {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${this.apiKey}`,
-      },
-      body: JSON.stringify({
-        model: this.model,
-        messages: [{ role: 'user', content: prompt }],
-        temperature,
-        top_p: topP,
-        ...(process.env.max_tokens
-          ? { max_tokens: +process.env.max_tokens }
-          : {}),
-        response_format: { type: 'json_object' },
-      }),
+    const body = JSON.stringify({
+      model: this.model,
+      messages: [{ role: 'user', content: prompt }],
+      temperature,
+      top_p: topP,
+      ...(process.env.max_tokens ? { max_tokens: +process.env.max_tokens } : {}),
+      response_format: { type: 'json_object' },
     });
 
-    console.timeEnd('code-review cost');
-
-    if (!res.ok) {
-      throw new Error(
-        `Mistral API request failed with status ${res.status}: ${await res.text()}`
-      );
-    }
-
-    const data = (await res.json()) as {
-      choices?: Array<{ message?: { content?: string | null } }>;
-    };
-    const content = data.choices?.[0]?.message?.content || '';
-
-    if (content) {
+    let lastError: unknown;
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       try {
-        const json = JSON.parse(content);
-        if (json.reviews && Array.isArray(json.reviews)) {
-          return json.reviews as Review[];
+        const res = await this.fetchImpl(`${this.endpoint}/chat/completions`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${this.apiKey}`,
+          },
+          body,
+          signal: AbortSignal.timeout(timeoutMs),
+        });
+
+        if (!res.ok) {
+          const text = await res.text();
+          throw new ApiError(
+            res.status,
+            `Mistral API request failed with status ${res.status}: ${text}`
+          );
         }
-        return json as Review;
-      } catch {
-        // Model did not return valid JSON: keep the raw text as a single review.
-        const firstLine = patch.split('\n')[0];
-        return {
-          lgtm: false,
-          hunk_header: firstLine.startsWith('@@') ? firstLine : undefined,
-          review_comment: content,
+
+        const data = (await res.json()) as {
+          choices?: Array<{ message?: { content?: string | null } }>;
         };
+        const content = data.choices?.[0]?.message?.content || '';
+
+        console.timeEnd('code-review cost');
+
+        if (content) {
+          try {
+            const json = JSON.parse(content);
+            if (json.reviews && Array.isArray(json.reviews)) {
+              return json.reviews as Review[];
+            }
+            return json as Review;
+          } catch {
+            // Model did not return valid JSON: keep the raw text as a single review.
+            const firstLine = patch.split('\n')[0];
+            return {
+              lgtm: false,
+              hunk_header: firstLine.startsWith('@@') ? firstLine : undefined,
+              review_comment: content,
+            };
+          }
+        }
+
+        return { lgtm: true, review_comment: '' };
+      } catch (e) {
+        lastError = e;
+        const retryable =
+          !(e instanceof ApiError) || e.status === 429 || e.status >= 500;
+        if (retryable && attempt < maxAttempts) {
+          await sleep(
+            baseDelayMs * 2 ** (attempt - 1) + Math.random() * baseDelayMs
+          );
+          continue;
+        }
+        break;
       }
     }
 
-    return { lgtm: true, review_comment: '' };
+    console.timeEnd('code-review cost');
+    throw lastError;
   };
 }

@@ -81,6 +81,15 @@ docker run --env-file .env mistral-cr-bot
 | `MAX_PATCH_LENGTH` | unlimited | Skip files whose diff is larger than this |
 | `IGNORE_PATTERNS` / `INCLUDE_PATTERNS` | — | Comma-separated glob/regex file filters |
 | `TARGET_LABEL` | — | Only review PRs with this label |
+| `MAX_CONCURRENCY` | `5` | Max parallel Mistral API calls across all files/chunks of a PR |
+| `CHUNK_MAX_LINES` | `200` | Large diffs are split into chunks of at most this many hunk lines, each reviewed in parallel |
+| `REQUEST_TIMEOUT_MS` | `120000` | Per-request timeout (aborts slow calls) |
+| `RETRY_ATTEMPTS` | `3` | Retries on 429/5xx/network errors |
+| `RETRY_BASE_DELAY_MS` | `500` | Backoff base; delay grows exponentially with jitter |
+
+## Concurrency & throughput
+
+Files in a PR are reviewed **in parallel**, bounded by `MAX_CONCURRENCY` (a semaphore shared across all files). Large diffs are additionally split into hunk-level chunks (`CHUNK_MAX_LINES`) that are also reviewed in parallel, then merged — hunk headers stay verbatim, so inline comment mapping still works. Each request has its own timeout and is retried with exponential backoff + jitter on 429/5xx/network errors; a file that ultimately fails is reported in the review body instead of failing the whole PR. For rapid pushes, add `concurrency: { group: pr-${{ github.event.pull_request.number }}, cancel-in-progress: true }` to your workflow so stale runs are cancelled.
 
 ## Development
 

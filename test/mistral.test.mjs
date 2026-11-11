@@ -73,9 +73,80 @@ test('codeReview returns lgtm for empty patch without calling the API', async ()
 });
 
 test('codeReview throws on API error', async () => {
-  const { fetchImpl } = makeFetch('', { ok: false, status: 429 });
-  const chat = new MistralChat('k', fetchImpl);
-  await assert.rejects(() => chat.codeReview('@@ -1 +1 @@\n-a\n'), /429/);
+  process.env.RETRY_ATTEMPTS = '1';
+  try {
+    const { calls, fetchImpl } = makeFetch('', { ok: false, status: 429 });
+    const chat = new MistralChat('k', fetchImpl);
+    await assert.rejects(() => chat.codeReview('@@ -1 +1 @@\n-a\n'), /429/);
+    assert.equal(calls.length, 1);
+  } finally {
+    delete process.env.RETRY_ATTEMPTS;
+  }
+});
+
+test('codeReview retries 429 with backoff then succeeds', async () => {
+  process.env.RETRY_BASE_DELAY_MS = '1';
+  try {
+    let n = 0;
+    const calls = [];
+    const fetchImpl = async (url, init) => {
+      calls.push({ url, init });
+      n++;
+      if (n < 3) {
+        return { ok: false, status: 429, json: async () => ({}), text: async () => 'rate limited' };
+      }
+      return {
+        ok: true,
+        status: 200,
+        json: async () => ({
+          choices: [
+            { message: { content: JSON.stringify({ reviews: [{ lgtm: true, review_comment: '' }] }) } },
+          ],
+        }),
+        text: async () => '',
+      };
+    };
+    const chat = new MistralChat('k', fetchImpl);
+    const res = await chat.codeReview('@@ -1 +1 @@\n-a\n');
+    assert.deepEqual(res, [{ lgtm: true, review_comment: '' }]);
+    assert.equal(calls.length, 3);
+    // each request carries an abort signal for the timeout
+    assert.ok(calls[0].init.signal instanceof AbortSignal);
+  } finally {
+    delete process.env.RETRY_BASE_DELAY_MS;
+  }
+});
+
+test('codeReview does not retry non-retryable 4xx', async () => {
+  process.env.RETRY_BASE_DELAY_MS = '1';
+  process.env.RETRY_ATTEMPTS = '3';
+  try {
+    const { calls, fetchImpl } = makeFetch('', { ok: false, status: 400 });
+    const chat = new MistralChat('k', fetchImpl);
+    await assert.rejects(() => chat.codeReview('@@ -1 +1 @@\n-a\n'), /400/);
+    assert.equal(calls.length, 1);
+  } finally {
+    delete process.env.RETRY_BASE_DELAY_MS;
+    delete process.env.RETRY_ATTEMPTS;
+  }
+});
+
+test('codeReview retries on network error then throws after max attempts', async () => {
+  process.env.RETRY_BASE_DELAY_MS = '1';
+  process.env.RETRY_ATTEMPTS = '2';
+  try {
+    let n = 0;
+    const fetchImpl = async () => {
+      n++;
+      throw new TypeError('fetch failed');
+    };
+    const chat = new MistralChat('k', fetchImpl);
+    await assert.rejects(() => chat.codeReview('@@ -1 +1 @@\n-a\n'), /fetch failed/);
+    assert.equal(n, 2);
+  } finally {
+    delete process.env.RETRY_BASE_DELAY_MS;
+    delete process.env.RETRY_ATTEMPTS;
+  }
 });
 
 test('constructor requires an API key', () => {
