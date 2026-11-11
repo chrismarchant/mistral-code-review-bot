@@ -142,6 +142,9 @@ export const buildManifest = (in_: ManifestInput): Record<string, unknown> => {
       reviewer: 'mistral-code-review-bot/gate-review',
       reviewerVersion: in_.reviewerVersion,
       mode: 'gate-review (read-only)',
+      reviewerIdentity: (in_.provenance as Record<string, unknown>)?.reviewerIdentity ?? null,
+      independenceNote:
+        'This review was executed by mistral-code-review-bot. The bot implementation/development session is not the independent reviewer; findings are model assessments over cited evidence.',
       provenance: in_.provenance,
     },
     repository: { owner: in_.owner, repo: in_.repo, pr: in_.pr.number, htmlUrl: in_.pr.htmlUrl },

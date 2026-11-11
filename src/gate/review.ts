@@ -80,6 +80,18 @@ export const runGateReview = async (deps: {
 
   // 4. complete baseline..candidate diff
   const compare = await github.getCompare();
+  if (compare.status !== 'ahead') {
+    budget.gap(
+      `compare ${pr.baseSha}...${pr.headSha} status is '${compare.status}' (expected 'ahead'); diff may be empty or inverted`
+    );
+    evidence.push({
+      id: 'diff-status',
+      category: 'diff',
+      kind: 'unresolved',
+      ref: `GET /repos/${owner}/${repo}/compare/${pr.baseSha}...${pr.headSha}`,
+      summary: `compare status '${compare.status}', not 'ahead' — diff coverage cannot be confirmed complete`,
+    });
+  }
   if (compare.filesTruncated) {
     budget.gap(
       `diff file list truncated by GitHub at ${compare.files.length} files; some changed files were not reviewed`
@@ -329,6 +341,18 @@ export const runGateReview = async (deps: {
     ...budget.gaps,
     ...(Array.isArray(synthesis?.coverage_limitations) ? synthesis.coverage_limitations.map(String) : []),
   ];
+
+  // deterministic guard: missing/unresolved material evidence can never yield
+  // an unconditional ACCEPT — at best ACCEPT WITH CONDITIONS
+  const unresolvedEvidence = evidence.filter((e) => e.kind === 'unresolved');
+  if (
+    disposition === 'ACCEPT' &&
+    (unresolvedEvidence.length > 0 || coverageLimitations.length > 0)
+  ) {
+    disposition = 'ACCEPT WITH CONDITIONS';
+    rationale = `downgraded from ACCEPT: ${unresolvedEvidence.length} unresolved evidence item(s) and ${coverageLimitations.length} coverage limitation(s) present. ${rationale}`;
+    budget.gap('disposition downgraded from ACCEPT because material evidence is unresolved');
+  }
   const residualRisks = Array.isArray(synthesis?.residual_risks)
     ? synthesis.residual_risks.map(String)
     : ['review incomplete or evidence missing; see coverage limitations'];

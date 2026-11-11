@@ -1,5 +1,6 @@
 node_modules/
 dist/
 .env
+gate-review-output/
 .DS_Store
 *.log

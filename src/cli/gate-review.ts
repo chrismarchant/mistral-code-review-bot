@@ -108,10 +108,17 @@ const main = async () => {
   });
   const chat = new MistralChat(mistralKey!);
 
+  // establish the ACTUAL GitHub identity behind the token (User vs App Bot)
+  const reviewerIdentity = await github.getViewerIdentity();
   const provenance = {
-    githubAppSlug: process.env.GITHUB_APP_SLUG ?? null,
-    tokenType: 'GITHUB_TOKEN',
+    reviewerIdentity,
+    githubAppSlug:
+      reviewerIdentity.type === 'Bot' ? reviewerIdentity.slug : process.env.GITHUB_APP_SLUG ?? null,
+    tokenType:
+      reviewerIdentity.type === 'Bot' ? 'github-app-installation' : 'oauth-or-PAT',
     invokedVia: 'cli',
+    independenceNote:
+      'Review executed by mistral-code-review-bot; the bot implementation session is not the independent reviewer.',
   };
 
   try {

@@ -374,3 +374,55 @@ test('sha256 integrity: tampered report fails manifest validation', async () => 
   const errors = validateManifest(result.manifest, result.report + 'tampered');
   assert.ok(errors.some((e) => e.includes('reportSha256')));
 });
+
+test('unresolved material evidence blocks unconditional ACCEPT', async () => {
+  const acceptAll = { ...goodSynthesis, disposition: 'ACCEPT', rationale: 'looks fine' };
+  const { result } = await runDefault({
+    chatHandler: (n) => ({
+      content: JSON.stringify(n === 5 ? acceptAll : n === 1 ? { summary: '', risk_areas: [] } : { findings: [] }),
+      usage: { total_tokens: 5 },
+    }),
+  });
+  // default mocks include an unresolved item (docs/huge.ts patch omitted by GitHub)
+  assert.equal(result.disposition, 'ACCEPT WITH CONDITIONS');
+  assert.match(result.manifest.rationale, /downgraded from ACCEPT/);
+  assert.ok(result.manifest.coverageLimitations.length > 0);
+});
+
+test('non-ahead compare status is recorded as unresolved diff coverage', async () => {
+  const { result } = await runDefault({
+    ghOverrides: {
+      '/compare/': okJson({ status: 'behind', ahead_by: 0, total_commits: 0, files: [] }),
+    },
+  });
+  assert.ok(result.evidence.some((e) => e.id === 'diff-status' && e.kind === 'unresolved'));
+  assert.ok(result.budget.gaps.some((g) => g.includes("'behind'")));
+});
+
+test('reviewer identity is resolved from the token and recorded in the manifest', async () => {
+  const gh = makeGithubFetch({ '/user': okJson({ login: 'chrismarchant', type: 'User' }) });
+  const github = makeGithub(gh.fetchImpl);
+  const identity = await github.getViewerIdentity();
+  assert.deepEqual(identity, { type: 'User', login: 'chrismarchant', source: 'GET /user' });
+
+  const chat = makeChat(defaultChatHandler);
+  const result = await runGateReview({
+    github, chat, profile: DEFAULT_PROFILE, owner: OWNER, repo: REPO,
+    execId: 'exec-id-1', now: () => new Date(), modelName: 'm', reviewerVersion: '1',
+    provenance: { reviewerIdentity: identity, tokenType: 'oauth-or-PAT' },
+  });
+  assert.equal(result.manifest.execution.reviewerIdentity.login, 'chrismarchant');
+  assert.match(result.manifest.execution.independenceNote, /not the independent reviewer/);
+  assert.deepEqual(validateManifest(result.manifest, result.report), []);
+});
+
+test('app installation tokens resolve to Bot identity via GET /app', async () => {
+  const gh = makeGithubFetch({
+    '/user': { ok: false, status: 401, json: async () => ({}), text: async () => 'bad credentials' },
+    '/app': okJson({ slug: 'mcrb-gate', name: 'MCRB Gate' }),
+  });
+  const github = makeGithub(gh.fetchImpl);
+  const identity = await github.getViewerIdentity();
+  assert.equal(identity.type, 'Bot');
+  assert.equal(identity.slug, 'mcrb-gate');
+});

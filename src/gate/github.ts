@@ -349,6 +349,24 @@ export class GitHubEvidence {
     return out;
   };
 
+  /**
+   * Resolve the actual GitHub identity behind the configured token:
+   * a User for OAuth/PAT tokens, a Bot (App) for app installation tokens.
+   */
+  getViewerIdentity = async (): Promise<Record<string, unknown>> => {
+    try {
+      const u = (await this.getJson('/user')) as Record<string, any>;
+      return { type: u.type ?? 'User', login: u.login, source: 'GET /user' };
+    } catch {
+      try {
+        const a = (await this.getJson('/app')) as Record<string, any>;
+        return { type: 'Bot', slug: a.slug, name: a.name, source: 'GET /app' };
+      } catch {
+        return { type: 'unknown', source: 'GET /user and GET /app both failed' };
+      }
+    }
+  };
+
   /** Existing reviews (used for duplicate-publication prevention). */
   listReviews = async (): Promise<Array<{ id: number; body?: string; user?: string }>> => {
     const d = (await this.getJson(
